@@ -77,7 +77,7 @@ make_tiled_copy_C_warpcontiguousN(Copy_Atom<Args...> const& copy_atom,
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Is_first, bool Is_last, bool Seq_parallel=false, bool Has_bias_table=false, typename Params>
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Is_first, bool Is_last, bool Seq_parallel=false, typename Params>
 inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const int bidb, const int bidh, const int n_block) {
 
     using Element = typename Kernel_traits::Element;
@@ -497,16 +497,32 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
                               m_block * kBlockM + get<0>(taccScS_row(0)), AtomLayoutMS * 16);
         }
 
-        // Bias table lookup: merged into apply_mask_local below (or applied standalone for non-boundary blocks)
-        if constexpr (Has_bias_table) {
-            // For non-boundary blocks where apply_mask_local won't be called, apply bias directly
-            if constexpr (!Is_local) {
-                FLASH_NAMESPACE::apply_mask_local<true, true>(scores,
-                    n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16,
-                    binfo.actual_seqlen_k, m_block * kBlockM + get<0>(taccScS_row(0)),
-                    binfo.actual_seqlen_q, AtomLayoutMS * 16,
-                    params.window_size_left, params.window_size_right,
-                    bias_table_head, params.bias_table_window_size);
+        // Bias table lookup (independent of Has_alibi to avoid perf penalty)
+        if (bias_table_head != nullptr) {
+            const int lane_id = threadIdx.x % 32;
+            const int col_off = n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16 + (lane_id % 4) * 2;
+            const int row_off = m_block * kBlockM + get<0>(taccScS_row(0));
+            const int half_w = params.bias_table_window_size / 2;
+            #pragma unroll
+            for (int mi = 0; mi < size<0, 1>(scores); ++mi) {
+                const int row_base = row_off + mi * AtomLayoutMS * 16;
+                #pragma unroll
+                for (int i = 0; i < size<0, 0>(scores); ++i) {
+                    const int row = row_base + i * 8;
+                    #pragma unroll
+                    for (int nj = 0; nj < size<1, 1>(scores); ++nj) {
+                        const int col_base = col_off + nj * 8;
+                        #pragma unroll
+                        for (int j = 0; j < size<1, 0>(scores); ++j) {
+                            const int col = col_base + j;
+                            const int rel = col - (row + binfo.actual_seqlen_k - binfo.actual_seqlen_q);
+                            const int idx = rel + half_w;
+                            if (idx >= 0 && idx < params.bias_table_window_size) {
+                                scores(make_coord(i, mi), make_coord(j, nj)) += bias_table_head[idx];
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -536,17 +552,13 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
                                          AtomLayoutMS * 16);
             }
         } else if (Is_local) {
-            const bool needs_mask = m_block * kBlockM < (n_block + 1) * kBlockN + binfo.actual_seqlen_q - binfo.actual_seqlen_k - params.window_size_right
+            if (m_block * kBlockM < (n_block + 1) * kBlockN + binfo.actual_seqlen_q - binfo.actual_seqlen_k - params.window_size_right
                 || (m_block + 1) * kBlockM >= n_block * kBlockN + binfo.actual_seqlen_q - binfo.actual_seqlen_k + params.window_size_left
-                || (!Is_even_MN && (n_block + 1) * kBlockN >= binfo.actual_seqlen_k);
-            if (needs_mask || Has_bias_table) {
-                FLASH_NAMESPACE::apply_mask_local<true, Has_bias_table>(scores,
-                                        n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16,
+                || (!Is_even_MN && (n_block + 1) * kBlockN >= binfo.actual_seqlen_k)) {
+                FLASH_NAMESPACE::apply_mask_local(scores, n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16,
                                         binfo.actual_seqlen_k, m_block * kBlockM + get<0>(taccScS_row(0)),
                                         binfo.actual_seqlen_q, AtomLayoutMS * 16,
-                                        params.window_size_left, params.window_size_right,
-                                        Has_bias_table ? bias_table_head : nullptr,
-                                        Has_bias_table ? params.bias_table_window_size : 0);
+                                        params.window_size_left, params.window_size_right);
             }
 
         }
@@ -615,7 +627,7 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         }
 
         // Accumulate dBias_Table via atomicAdd
-        if constexpr (Has_bias_table) {
+        if (params.dbias_table_ptr != nullptr) {
             const int lane_id = threadIdx.x % 32;
             const int col_idx_offset = n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16 + (lane_id % 4) * 2;
             const int row_idx_offset = m_block * kBlockM + get<0>(taccScS_row(0));
@@ -877,7 +889,7 @@ inline __device__ void compute_dq_dk_dv(const Params &params) {
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, bool Has_bias_table=false, typename Params>
+template<typename Kernel_traits, bool Is_dropout, bool Is_causal, bool Is_local, bool Has_alibi, bool Is_even_MN, bool Is_even_K, bool Is_softcap, typename Params>
 inline __device__ void compute_dq_dk_dv_seqk_parallel(const Params &params) {
 
     // The block index for the batch.
@@ -887,7 +899,7 @@ inline __device__ void compute_dq_dk_dv_seqk_parallel(const Params &params) {
 
     // If deterministic, each thread block will do atomicAdd to a different dQ_accum buffer.
     for (int n_block = blockIdx.x; n_block < (params.seqlen_k + Kernel_traits::kBlockN - 1) / Kernel_traits::kBlockN; n_block += gridDim.x) {
-        compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, false, false, /*Seq_parallel=*/true, Has_bias_table>(params, bidb, bidh, n_block);
+        compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Is_local, Has_alibi, Is_even_MN, Is_even_K, Is_softcap, false, false, /*Seq_parallel=*/true>(params, bidb, bidh, n_block);
     }
 }
 

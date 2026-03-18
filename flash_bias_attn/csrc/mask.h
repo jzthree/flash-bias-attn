@@ -35,15 +35,17 @@ __forceinline__ __device__ void apply_mask(Tensor<Engine, Layout> &tensor, const
     }
 }
 
-template <bool HasWSLeft=true, typename Engine, typename Layout>
+template <bool HasWSLeft=true, bool HasBiasTable=false, typename Engine, typename Layout>
 __forceinline__ __device__ void apply_mask_local(Tensor<Engine, Layout> &tensor, const int col_idx_offset_,
                                         const int max_seqlen_k, const int row_idx_offset,
                                         const int max_seqlen_q, const int warp_row_stride,
-                                        const int window_size_left, const int window_size_right) {
+                                        const int window_size_left, const int window_size_right,
+                                        const float *bias_table=nullptr, const int bias_table_size=0) {
     // tensor has shape (nrow=(2, MMA_M), ncol=(2, MMA_N))
     static_assert(Layout::rank == 2, "Only support 2D Tensor");
     const int lane_id = threadIdx.x % 32;
     const int col_idx_offset = col_idx_offset_ + (lane_id % 4) * 2;
+    [[maybe_unused]] const int half_w = bias_table_size / 2;
     #pragma unroll
     for (int mi = 0; mi < size<0, 1>(tensor); ++mi) {
         const int row_idx_base = row_idx_offset + mi * warp_row_stride;
@@ -58,6 +60,13 @@ __forceinline__ __device__ void apply_mask_local(Tensor<Engine, Layout> &tensor,
                 #pragma unroll
                 for (int j = 0; j < size<1, 0>(tensor); ++j) {
                     const int col_idx = col_idx_base + j;
+                    if constexpr (HasBiasTable) {
+                        const int rel = col_idx - (row_idx + max_seqlen_k - max_seqlen_q);
+                        const int idx = rel + half_w;
+                        if (idx >= 0 && idx < bias_table_size) {
+                            tensor(make_coord(i, mi), make_coord(j, nj)) += bias_table[idx];
+                        }
+                    }
                     if (col_idx >= col_idx_limit_right || (HasWSLeft && col_idx < col_idx_limit_left)) {
                         tensor(make_coord(i, mi), make_coord(j, nj)) = -INFINITY;
                     }
