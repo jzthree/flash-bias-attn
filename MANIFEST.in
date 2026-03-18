@@ -1,0 +1,3 @@
+include README.md
+include pyproject.toml
+recursive-include flash_bias_attn/csrc *.h *.cuh *.cu *.cpp
