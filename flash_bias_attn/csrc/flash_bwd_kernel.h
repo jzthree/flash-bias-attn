@@ -596,7 +596,41 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
                 dS(mi, ni) = scaled_ds;
             }
         }
-        // if (cute::thread0()) { print(dS); }
+
+        // Accumulate dBias_Table via atomicAdd
+        if (params.dbias_table_ptr != nullptr) {
+            const int lane_id = threadIdx.x % 32;
+            const int col_idx_offset = n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16 + (lane_id % 4) * 2;
+            const int row_idx_offset = m_block * kBlockM + get<0>(taccScS_row(0));
+            const int warp_row_stride = AtomLayoutMS * 16;
+            const int half_w = params.bias_table_window_size / 2;
+            float *dbias_head = params.dbias_table_ptr + bidh * params.bias_table_window_size;
+            #pragma unroll
+            for (int mi = 0; mi < size<0, 1>(dS); ++mi) {
+                const int row_idx = row_idx_offset + mi * warp_row_stride;
+                #pragma unroll
+                for (int i = 0; i < size<0, 0>(dS); ++i) {
+                    const int row = row_idx + i * 8;
+                    if (row < binfo.actual_seqlen_q) {
+                        #pragma unroll
+                        for (int nj = 0; nj < size<1, 1>(dS); ++nj) {
+                            const int col_idx_base = col_idx_offset + nj * 8;
+                            #pragma unroll
+                            for (int j = 0; j < size<1, 0>(dS); ++j) {
+                                const int col = col_idx_base + j;
+                                if (col < binfo.actual_seqlen_k) {
+                                    const int rel = col - (row + binfo.actual_seqlen_k - binfo.actual_seqlen_q);
+                                    const int idx = rel + half_w;
+                                    if (idx >= 0 && idx < params.bias_table_window_size) {
+                                        atomicAdd(dbias_head + idx, dS(make_coord(i, mi), make_coord(j, nj)));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         Tensor acc_dq = partition_fragment_C(tiled_mma_dq, Shape<Int<kBlockM>, Int<kHeadDim>>{});  // MMA, MMA_N, MMA_K
         tdQgdQaccum.data() = tdQgdQaccum.data() + (-int(kBlockM * params.h * params.d_rounded));

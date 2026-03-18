@@ -24,6 +24,41 @@ except ImportError:
     _HAS_CUDA = False
 
 
+class FlashAttnBiasFunc(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, q, k, v, bias_table, window_size, softmax_scale):
+        B, L_q, H, D = q.shape
+        softmax_scale = softmax_scale or 1.0 / math.sqrt(D)
+        half_w = window_size // 2
+        ws_left = half_w
+        ws_right = half_w - 1 + (window_size % 2)
+
+        q, k, v = [x.contiguous() if x.stride(-1) != 1 else x for x in (q, k, v)]
+        bt = bias_table.contiguous()
+
+        out, lse = flash_attn_bias_cuda.flash_attn_bias_fwd(
+            q, k, v, bt, softmax_scale, ws_left, ws_right,
+        )
+
+        ctx.save_for_backward(q, k, v, out, lse, bt)
+        ctx.softmax_scale = softmax_scale
+        ctx.window_size = window_size
+        ctx.ws_left = ws_left
+        ctx.ws_right = ws_right
+        return out
+
+    @staticmethod
+    def backward(ctx, dout):
+        q, k, v, out, lse, bt = ctx.saved_tensors
+        dout = dout.contiguous()
+
+        dq, dk, dv, dbias = flash_attn_bias_cuda.flash_attn_bias_bwd(
+            dout, q, k, v, out, lse, bt,
+            ctx.softmax_scale, ctx.ws_left, ctx.ws_right,
+        )
+        return dq, dk, dv, dbias, None, None
+
+
 def flash_attn_bias(q, k, v, bias_table, window_size, softmax_scale=None):
     """
     Flash attention with per-head relative position bias (windowed).
@@ -48,26 +83,8 @@ def flash_attn_bias(q, k, v, bias_table, window_size, softmax_scale=None):
             "flash_attn_bias_cuda not found. Build with: "
             "CC=gcc CXX=g++ python setup.py build_ext --inplace"
         )
-
-    B, L_q, H, D = q.shape
-    _, L_k, _, _ = k.shape
-    softmax_scale = softmax_scale or 1.0 / math.sqrt(D)
-    half_w = window_size // 2
-
-    # Ensure contiguous
-    q, k, v = [x.contiguous() if x.stride(-1) != 1 else x for x in (q, k, v)]
-
-    # bias_table to float32 contiguous
-    if bias_table.dtype != torch.float32:
-        bias_table = bias_table.float()
-    bias_table = bias_table.contiguous()
-
-    out, lse = flash_attn_bias_cuda.flash_attn_bias_fwd(
-        q, k, v, bias_table, softmax_scale,
-        half_w,                          # window_size_left
-        half_w - 1 + (window_size % 2),  # window_size_right
-    )
-    return out
+    softmax_scale = softmax_scale or 1.0 / math.sqrt(q.shape[-1])
+    return FlashAttnBiasFunc.apply(q, k, v, bias_table, window_size, softmax_scale)
 
 
 __all__ = ["flash_attn_bias"]

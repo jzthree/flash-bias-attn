@@ -64,6 +64,7 @@ setup(
             sources=[
                 "flash_bias_attn/csrc/flash_api_bias.cpp",
                 "flash_bias_attn/csrc/flash_fwd_hdim32_bf16_sm80.cu",
+                "flash_bias_attn/csrc/flash_bwd_hdim32_bf16_sm80.cu",
             ],
             include_dirs=[
                 os.path.abspath("flash_bias_attn/csrc"),

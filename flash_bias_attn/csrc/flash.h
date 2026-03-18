@@ -186,6 +186,9 @@ struct Flash_bwd_params : public Flash_fwd_params {
 
     bool deterministic;
     index_t dq_accum_split_stride;
+
+    // Gradient for bias table: (nheads, bias_table_window_size) float, accumulated via atomicAdd
+    float *__restrict__ dbias_table_ptr;
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
