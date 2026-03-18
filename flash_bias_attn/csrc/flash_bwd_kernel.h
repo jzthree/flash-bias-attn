@@ -455,7 +455,7 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     const float *bias_table_head = params.bias_table_ptr != nullptr
         ? params.bias_table_ptr + bidh * params.bias_table_window_size
         : nullptr;
-    FLASH_NAMESPACE::Alibi<Is_causal> alibi(alibi_slope, binfo.actual_seqlen_k, binfo.actual_seqlen_q, bias_table_head, params.bias_table_window_size);
+    FLASH_NAMESPACE::Alibi<Is_causal> alibi(alibi_slope, binfo.actual_seqlen_k, binfo.actual_seqlen_q);
 
     for (; m_block >= m_block_min; --m_block) {
         Tensor acc_s = partition_fragment_C(tiled_mma_sdp, Shape<Int<kBlockM>, Int<kBlockN>>{});  // (MMA=4, MMA_N, MMA_N)
@@ -495,6 +495,35 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
         if (Has_alibi) {
             alibi.apply_alibi(scores, n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16,
                               m_block * kBlockM + get<0>(taccScS_row(0)), AtomLayoutMS * 16);
+        }
+
+        // Bias table lookup (independent of Has_alibi to avoid perf penalty)
+        if (bias_table_head != nullptr) {
+            const int lane_id = threadIdx.x % 32;
+            const int col_off = n_block * kBlockN + (tidx / 32 / AtomLayoutMS) * MMA_N_SdP * 16 + (lane_id % 4) * 2;
+            const int row_off = m_block * kBlockM + get<0>(taccScS_row(0));
+            const int half_w = params.bias_table_window_size / 2;
+            #pragma unroll
+            for (int mi = 0; mi < size<0, 1>(scores); ++mi) {
+                const int row_base = row_off + mi * AtomLayoutMS * 16;
+                #pragma unroll
+                for (int i = 0; i < size<0, 0>(scores); ++i) {
+                    const int row = row_base + i * 8;
+                    #pragma unroll
+                    for (int nj = 0; nj < size<1, 1>(scores); ++nj) {
+                        const int col_base = col_off + nj * 8;
+                        #pragma unroll
+                        for (int j = 0; j < size<1, 0>(scores); ++j) {
+                            const int col = col_base + j;
+                            const int rel = col - (row + binfo.actual_seqlen_k - binfo.actual_seqlen_q);
+                            const int idx = rel + half_w;
+                            if (idx >= 0 && idx < params.bias_table_window_size) {
+                                scores(make_coord(i, mi), make_coord(j, nj)) += bias_table_head[idx];
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // TD [2023-07-29]: I was thinking that we don't need to mask out the elements beyond

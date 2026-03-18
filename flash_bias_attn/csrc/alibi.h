@@ -19,16 +19,11 @@ struct Alibi {
 
     const float alibi_slope;
     const int max_seqlen_k, max_seqlen_q;
-    const float *bias_table;
-    const int bias_table_size;
 
-    __forceinline__ __device__ Alibi(const float alibi_slope, const int max_seqlen_k, const int max_seqlen_q,
-                                     const float *bias_table=nullptr, const int bias_table_size=0)
+    __forceinline__ __device__ Alibi(const float alibi_slope, const int max_seqlen_k, const int max_seqlen_q)
         : alibi_slope(alibi_slope)
         , max_seqlen_k(max_seqlen_k)
-        , max_seqlen_q(max_seqlen_q)
-        , bias_table(bias_table)
-        , bias_table_size(bias_table_size) {
+        , max_seqlen_q(max_seqlen_q) {
     };
 
 
@@ -68,14 +63,6 @@ struct Alibi {
                         for (int j = 0; j < size<1, 0>(tensor); ++j) {
                             const int col_idx = col_idx_base + j;
                             tensor(make_coord(i, mi), make_coord(j, nj)) -= alibi_slope * abs(row_idx + max_seqlen_k - max_seqlen_q - col_idx);
-                            if (bias_table != nullptr) {
-                                const int rel = col_idx - (row_idx + max_seqlen_k - max_seqlen_q);
-                                const int half_w = bias_table_size / 2;
-                                const int idx = rel + half_w;
-                                if (idx >= 0 && idx < bias_table_size) {
-                                    tensor(make_coord(i, mi), make_coord(j, nj)) += bias_table[idx];
-                                }
-                            }
                         }
                     }
                 }

@@ -232,14 +232,7 @@ std::vector<at::Tensor> flash_attn_bias_bwd(
     // dBias table pointer
     params.dbias_table_ptr = dbias_table.defined() ? dbias_table.data_ptr<float>() : nullptr;
 
-    // Force Has_alibi=true in backward so alibi.apply_alibi() runs (which includes our bias lookup).
-    // Zero slopes have no effect on the computation.
-    at::Tensor alibi_slopes_dummy;
-    if (bias_table_f32.defined()) {
-        alibi_slopes_dummy = torch::zeros({num_heads}, q.options().dtype(at::kFloat));
-        params.alibi_slopes_ptr = alibi_slopes_dummy.data_ptr();
-        params.alibi_slopes_batch_stride = 0;
-    }
+    // No alibi_slopes needed — bias table lookup is independent of Has_alibi template
 
     auto stream = at::cuda::getCurrentCUDAStream().stream();
     TORCH_CHECK(head_size <= 32, "Only head_size <= 32 supported");
