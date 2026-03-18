@@ -1,0 +1,60 @@
+name: Build wheels
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  build-wheels:
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.10", "3.11", "3.12"]
+        cuda: ["12.1.0", "12.4.0"]
+        os: [ubuntu-22.04]
+
+    runs-on: ${{ matrix.os }}
+    container:
+      image: nvidia/cuda:${{ matrix.cuda }}-devel-ubuntu22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system deps
+        run: |
+          apt-get update && apt-get install -y git python${{ matrix.python }} python${{ matrix.python }}-dev python3-pip
+          update-alternatives --install /usr/bin/python3 python3 /usr/bin/python${{ matrix.python }} 1
+
+      - name: Clone CUTLASS
+        run: git clone --depth 1 https://github.com/NVIDIA/cutlass.git
+
+      - name: Install Python deps
+        run: |
+          python3 -m pip install --upgrade pip setuptools wheel
+          python3 -m pip install torch --index-url https://download.pytorch.org/whl/cu${CUDA_SHORT}
+        env:
+          CUDA_SHORT: ${{ matrix.cuda == '12.1.0' && '121' || '124' }}
+
+      - name: Build wheel
+        run: |
+          CUTLASS_PATH=./cutlass TORCH_CUDA_ARCH_LIST="8.0;8.6;8.9;9.0" python3 setup.py bdist_wheel
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-py${{ matrix.python }}-cu${{ matrix.cuda }}-${{ matrix.os }}
+          path: dist/*.whl
+
+  publish:
+    needs: build-wheels
+    runs-on: ubuntu-latest
+    if: github.event_name == 'release'
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: pypa/gh-action-pypi-publish@release/v1
