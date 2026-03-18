@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=45", "torch>=2.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flash-bias-attn"
+version = "0.1.0"
+description = "Flash Attention with exact per-head relative position bias"
+readme = "README.md"
+license = {text = "BSD-3-Clause"}
+requires-python = ">=3.8"
+dependencies = ["torch>=2.0"]
+
+[project.urls]
+Homepage = "https://github.com/jzthree/flash-bias-attn"
