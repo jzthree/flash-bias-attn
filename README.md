@@ -56,11 +56,11 @@ The trainable-bias case includes `dbias` accumulation. When the bias table is fr
 
 **Why this is a good result**
 
-- The `262 ms` number is for the hard case: **exact, trainable, sliding-window attention with per-head relative-position bias**. It includes the backward pass for the bias table itself, not just `dQ/dK/dV`.
-- The gap from frozen to trainable bias is only about **`110 ms`** (`262 - 152`). That isolates the remaining cost to `dbias` accumulation; the rest of the flash-attn backward path stays close to the frozen-bias case.
-- The forward/backward split above is there to show where the remaining cost lives, not to compare against a weaker operation. The meaningful method comparison is the full-step table against other exact local-bias implementations.
-- This repo is solving a problem that stock flash-attn does not handle directly: **exact backward for trainable relative-position bias tables inside sliding-window attention**. Low-rank concat-style methods can be faster, but in our experiments they showed large approximation error at practical ranks and are not a drop-in replacement.
-- The relevant sales pitch is not “we are close to no-bias flash attention.” It is “among implementations that actually support exact trainable relative-position bias inside fused local attention, this keeps the training step in the low hundreds of milliseconds instead of `749 ms` Triton or multi-second score-mod paths.”
+- This is the benchmark that matters for this repo: **exact sliding-window attention with a trainable per-head relative-position bias table**. The `262 ms` number includes `dQ/dK/dV` and `dbias`, not just the attention backward pass.
+- Against other implementations of the same operation on this shape, the CUDA path here is materially faster: **`262 ms` vs `749 ms` Triton** and **`262 ms` vs `9,386 ms` FlexAttention + `score_mod`**.
+- The frozen-bias result (`152 ms`) is useful because it shows where the remaining training cost lives. Going from frozen to trainable bias adds about **`110 ms`**, so the dominant remaining overhead is `dbias` accumulation rather than the fused attention backward itself.
+- Stock flash-attn does not provide this exact feature combination out of the box: local attention, exact Toeplitz bias lookup, and backward for a trainable bias table. That is the gap this repo is addressing.
+- Approximate alternatives such as concat / FlashBias-style parameterizations may be faster at low rank, but they are not numerically close enough to treat as equivalent for this use case. This repo is aimed at the exact path.
 
 ## How it works
 
