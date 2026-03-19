@@ -2,14 +2,15 @@
 
 **Fast exact attention with per-head relative position bias.**
 
-Adds a Toeplitz bias table lookup to Flash Attention's CUDA kernel. Exact computation with ~1.5x overhead vs no-bias flash attention — **79x faster** than FlexAttention with `score_mod`.
+Adds a Toeplitz bias table lookup to Flash Attention's CUDA kernel. Exact forward and backward are implemented, with materially lower training-step cost than generic score-mod approaches.
 
 ```python
 from flash_bias_attn import flash_attn_bias
 
 # q, k, v: (batch, seqlen, nheads, headdim) float16/bfloat16
 # bias_table: (nheads, window_size) — learned per-head relative position bias
-output = flash_attn_bias(q, k, v, bias_table, window_size=128)
+# window_size is the full bias-table width; use 257 for a local window of +/-128
+output = flash_attn_bias(q, k, v, bias_table, window_size=257)
 ```
 
 ## What it does
@@ -24,24 +25,17 @@ Only positions within the sliding window contribute. The bias table is a 1D arra
 
 ## Performance
 
-Benchmarked on NVIDIA GH200, B=600, L=4600, H=8, D=16, W=128 (bfloat16):
-
-| Method | Forward (ms) | vs no-bias |
-|--------|-------------|------------|
-| Flash Attention (no bias) | 21 | 1.0x |
-| **flash-bias-attn (this)** | **33** | **1.5x** |
-| FlashBias concat rank=16 | 194 | 3.0x |
-| Custom Triton kernel | 749 | 11.7x |
-| FlexAttention + score_mod | 9,386 | 122x |
+Benchmarked on NVIDIA GH200, bfloat16, `B=600, L=4600, H=8, D=16`, with local window `+/-128` (`window_size=257`):
 
 **Forward + backward** timing (full training step):
 
 | Method | Step (ms) | vs no-bias |
 |--------|----------|------------|
-| Flash Attention (no bias) | 64 | 1.0x |
-| FlashBias concat rank=16 | 194 | 3.0x |
-| Custom Triton kernel | 749 | 11.7x |
-| FlexAttention + score_mod | 9,386 | 122x |
+| Flash Attention (no bias) | 59 | 1.0x |
+| **flash-bias-attn exact (frozen bias table)** | **152** | **2.6x** |
+| **flash-bias-attn exact (trainable bias table)** | **262** | **4.5x** |
+
+The trainable-bias case includes `dbias` accumulation. When the bias table is frozen, that path is skipped and the step is materially cheaper.
 
 ## How it works
 
@@ -64,7 +58,7 @@ The bias table values are pre-divided by `softmax_scale` to match Flash Attentio
 ### Why not other approaches?
 
 - **FlexAttention + score_mod**: The `score_mod` callback prevents kernel fusion, causing 122x slowdown
-- **FlashBias concatenation trick**: Decomposes bias via Fourier/SVD into augmented Q,K dimensions. Fast (~3x) but approximate unless using full rank (which makes head dim too large)
+- **FlashBias concatenation trick**: Fast at very low rank, but for trainable relative-position bias it showed large approximation error at practical ranks. The concat path is now deprecated and kept only as an experimental baseline.
 - **Custom Triton kernel**: Correct but 12x slower than Flash Attention's optimized CUDA (the "Triton tax")
 - **This approach**: Directly modifies the CUDA kernel — exact and fast
 
@@ -95,9 +89,10 @@ CC=gcc CXX=g++ CUTLASS_PATH=./cutlass python setup.py build_ext --inplace
 
 ### Current limitations
 
-- **Forward only** — backward pass not yet implemented (use `flash_attn_func` backward or the Triton kernel for training)
+- **Backward is implemented, but trainable bias is still materially slower than no-bias flash attention** — the remaining cost is dominated by `dbias` accumulation
 - **Head dim ≤ 32** — only `hdim32` kernel instantiation included (add more `.cu` files from flash-attn for larger head dims)
 - **bfloat16 only** — add float16 `.cu` instantiation for fp16 support
+- **Concat path is deprecated** — retained only as an experimental baseline, not recommended for trainable exact bias
 - Based on Flash Attention 2.8.3 (sm80 CUDA core path)
 
 ## API
@@ -108,12 +103,14 @@ flash_attn_bias(
     k,              # (batch, seqlen_k, nheads_k, headdim)
     v,              # (batch, seqlen_k, nheads_k, headdim)
     bias_table,     # (nheads, window_size) — relative position bias
-    window_size,    # int — symmetric window size
+    window_size,    # int — full bias-table width
     softmax_scale=None,  # float, default 1/sqrt(headdim)
 ) -> output  # (batch, seqlen_q, nheads, headdim)
 ```
 
-The bias for position pair (i, j) is `bias_table[head, j - i + window_size // 2]`, applied only when `|j - i| < window_size // 2`.
+The bias for position pair `(i, j)` is `bias_table[head, j - i + window_size // 2]`, applied only inside the local window implied by `window_size`.
+
+Example: for a local window of `+/-128`, use `window_size=257`.
 
 ## Use cases
 
