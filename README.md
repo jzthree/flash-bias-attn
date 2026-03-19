@@ -35,32 +35,30 @@ Benchmarked on NVIDIA GH200, bfloat16, `B=600, L=4600, H=8, D=16`, with local wi
 | Custom Triton kernel | Yes | Yes | 749 |
 | FlexAttention + `score_mod` | Yes | Yes | 9,386 |
 
-These are the relevant comparisons: all three support local attention with learned relative-position bias. The no-bias flash-attn baseline is useful for understanding incremental overhead, but it is not an alternative implementation of the same feature set.
+These are the relevant comparisons: all three support local attention with learned relative-position bias.
 
 **Exact-path phase breakdown**
 
 Forward only:
 
-| Configuration | Forward (ms) | vs no-bias |
-|--------------|-------------|------------|
-| Flash Attention (no bias, same local window) | 18.4 | 1.0x |
-| flash-bias-attn exact | 64.4 | 3.5x |
+| Configuration | Forward (ms) |
+|--------------|-------------|
+| flash-bias-attn exact | 64.4 |
 
 Backward only:
 
-| Configuration | Backward (ms) | vs no-bias |
-|--------------|--------------|------------|
-| Flash Attention (no bias, same local window) | 43.6 | 1.0x |
-| flash-bias-attn exact (frozen bias table) | 97.3 | 2.2x |
-| flash-bias-attn exact (trainable bias table) | 193.5 | 4.4x |
+| Configuration | Backward (ms) |
+|--------------|--------------|
+| flash-bias-attn exact (frozen bias table) | 97.3 |
+| flash-bias-attn exact (trainable bias table) | 193.5 |
 
-The trainable-bias case includes `dbias` accumulation. When the bias table is frozen, that path is skipped and the backward pass is materially cheaper. Phase timings are measured separately, so they will not sum exactly to the full-step table above.
+The trainable-bias case includes `dbias` accumulation. When the bias table is frozen, that path is skipped and the backward pass is materially cheaper. These phase timings are an internal breakdown of the exact kernel, not an alternative-method comparison, so they do not replace the full-step table above.
 
 **Why this is a good result**
 
 - The `262 ms` number is for the hard case: **exact, trainable, sliding-window attention with per-head relative-position bias**. It includes the backward pass for the bias table itself, not just `dQ/dK/dV`.
 - The gap from frozen to trainable bias is only about **`110 ms`** (`262 - 152`). That isolates the remaining cost to `dbias` accumulation; the rest of the flash-attn backward path stays close to the frozen-bias case.
-- The frozen-bias result, `152 ms`, shows the cost of exact bias-aware **local attention** without bias-table gradients. That is still only **2.6x** over no-bias sliding-window flash attention while preserving exact Toeplitz bias semantics.
+- The forward/backward split above is there to show where the remaining cost lives, not to compare against a weaker operation. The meaningful method comparison is the full-step table against other exact local-bias implementations.
 - This repo is solving a problem that stock flash-attn does not handle directly: **exact backward for trainable relative-position bias tables inside sliding-window attention**. Low-rank concat-style methods can be faster, but in our experiments they showed large approximation error at practical ranks and are not a drop-in replacement.
 - The relevant sales pitch is not “we are close to no-bias flash attention.” It is “among implementations that actually support exact trainable relative-position bias inside fused local attention, this keeps the training step in the low hundreds of milliseconds instead of `749 ms` Triton or multi-second score-mod paths.”
 
