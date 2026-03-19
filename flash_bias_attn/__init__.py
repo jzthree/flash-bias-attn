@@ -15,13 +15,27 @@ Usage:
 """
 
 import math
+import importlib.util
+from pathlib import Path
 import torch
+from .concat import flash_attn_bias_concat
 
 try:
     import flash_attn_bias_cuda
     _HAS_CUDA = True
 except ImportError:
-    _HAS_CUDA = False
+    try:
+        _repo_root = Path(__file__).resolve().parent.parent
+        _candidates = sorted(_repo_root.glob("flash_attn_bias_cuda*.so"))
+        if _candidates:
+            _spec = importlib.util.spec_from_file_location("flash_attn_bias_cuda", _candidates[0])
+            flash_attn_bias_cuda = importlib.util.module_from_spec(_spec)
+            _spec.loader.exec_module(flash_attn_bias_cuda)
+            _HAS_CUDA = True
+        else:
+            _HAS_CUDA = False
+    except Exception:
+        _HAS_CUDA = False
 
 
 class FlashAttnBiasFunc(torch.autograd.Function):
@@ -54,7 +68,7 @@ class FlashAttnBiasFunc(torch.autograd.Function):
 
         dq, dk, dv, dbias = flash_attn_bias_cuda.flash_attn_bias_bwd(
             dout, q, k, v, out, lse, bt,
-            ctx.softmax_scale, ctx.ws_left, ctx.ws_right,
+            ctx.softmax_scale, ctx.ws_left, ctx.ws_right, ctx.needs_input_grad[3],
         )
         return dq, dk, dv, dbias, None, None
 

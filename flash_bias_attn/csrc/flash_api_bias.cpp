@@ -151,7 +151,8 @@ std::vector<at::Tensor> flash_attn_bias_bwd(
     at::Tensor &out, at::Tensor &softmax_lse,
     at::Tensor &bias_table,
     float softmax_scale,
-    int window_size_left, int window_size_right
+    int window_size_left, int window_size_right,
+    bool compute_dbias
 ) {
     TORCH_CHECK(q.is_cuda(), "q must be on CUDA");
     TORCH_CHECK(q.dtype() == at::kBFloat16, "Only bf16 supported");
@@ -184,7 +185,7 @@ std::vector<at::Tensor> flash_attn_bias_bwd(
 
     // dBias_Table accumulator (float32)
     int window_size = bias_table.defined() ? bias_table.size(1) : 0;
-    auto dbias_table = window_size > 0
+    auto dbias_table = compute_dbias && window_size > 0
         ? torch::zeros({num_heads, window_size}, q.options().dtype(at::kFloat))
         : at::Tensor();
 
@@ -267,5 +268,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("flash_attn_bias_fwd", &flash_attn_bias_fwd,
           "Flash attention forward with bias table");
     m.def("flash_attn_bias_bwd", &flash_attn_bias_bwd,
+          pybind11::arg("dout"), pybind11::arg("q"), pybind11::arg("k"), pybind11::arg("v"),
+          pybind11::arg("out"), pybind11::arg("softmax_lse"), pybind11::arg("bias_table"),
+          pybind11::arg("softmax_scale"), pybind11::arg("window_size_left"), pybind11::arg("window_size_right"),
+          pybind11::arg("compute_dbias") = true,
           "Flash attention backward with bias table gradient");
 }

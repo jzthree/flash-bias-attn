@@ -42,6 +42,7 @@ print(f"CUTLASS include: {cutlass_include}")
 
 # Detect GPU architectures
 gpu_archs = os.environ.get("TORCH_CUDA_ARCH_LIST", "8.0;9.0").replace(" ", "")
+max_rregcount = os.environ.get("FLASH_BIAS_MAXRREGCOUNT", "128")
 gencode_flags = []
 for arch in gpu_archs.split(";"):
     arch_num = arch.replace(".", "")
@@ -79,7 +80,7 @@ setup(
                     "-U__CUDA_NO_HALF_OPERATORS__",
                     "-U__CUDA_NO_HALF_CONVERSIONS__",
                     "-U__CUDA_NO_BFLOAT16_CONVERSIONS__",
-                    "--use_fast_math",
+                    "--use_fast_math", f"--maxrregcount={max_rregcount}",
                     "-lineinfo",
                 ] + gencode_flags,
             },

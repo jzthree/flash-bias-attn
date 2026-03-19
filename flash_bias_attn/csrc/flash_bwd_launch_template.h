@@ -99,11 +99,9 @@ void run_flash_bwd_seqk_parallel(Flash_bwd_params &params, cudaStream_t stream) 
             LOCAL_SWITCH((params.window_size_left >= 0 || params.window_size_right >= 0) && !params.is_causal, Is_local, [&] {
                 ALIBI_SWITCH(params.alibi_slopes_ptr != nullptr, Has_alibi, [&] {
                     SOFTCAP_SWITCH(params.softcap > 0.0, Is_softcap, [&] {
-                        // If not IsEvenKConst, we also set IsEvenMNConst to false to reduce number of templates.
-                        // If head dim > 128, set IsEvenMNConst to false to reduce number of templates
-                        // If Is_local, set Is_causal to false
+                        // Bias-table support should not disable the fast even-M/N or even-K paths.
+                        // Only ALiBi requires the more conservative specialization.
                         auto kernel = &flash_bwd_dq_dk_dv_loop_seqk_parallel_kernel<Kernel_traits, Is_dropout && !Is_softcap, Is_causal, Is_local && !Is_causal, Has_alibi, IsEvenMNConst && IsEvenKConst && !Is_local && !Has_alibi && Kernel_traits::kHeadDim <= 128, IsEvenKConst && !Has_alibi, Is_softcap>;
-                        // auto kernel = &flash_bwd_dq_dk_dv_loop_seqk_parallel_kernel<Kernel_traits, false, Is_causal, false, false, true, true>;
                         if (smem_size_dq_dk_dv >= 48 * 1024)  {
                             C10_CUDA_CHECK(cudaFuncSetAttribute(
                                 kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size_dq_dk_dv));
@@ -143,8 +141,17 @@ void run_mha_bwd_hdim32(Flash_bwd_params &params, cudaStream_t stream) {
     if (status_ != cudaSuccess) {
       C10_CUDA_CHECK(status_);
     }
+    const bool has_bias_table = params.bias_table_ptr != nullptr || params.dbias_table_ptr != nullptr;
     DROPOUT_SWITCH(params.p_dropout < 1.f, Is_dropout, [&] {
-        if (max_smem_per_block >= 2 * ((3 * 128 + 2 * 128) * Headdim + 2 * 128 * 128)) { // 104 KB
+        if (has_bias_table) {
+            // The bias-table path adds per-score work and is much more register-sensitive.
+            // Prefer a lower-pressure 64x128 tile for hdim32 when bias is active.
+            if constexpr(!Is_dropout) {
+                run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 128, 8, 2, 4, 4, true, false, T>, Is_dropout, Is_causal>(params, stream);
+            } else {
+                run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 64, 128, 8, 2, 4, 4, false, false, T>, Is_dropout, Is_causal>(params, stream);
+            }
+        } else if (max_smem_per_block >= 2 * ((3 * 128 + 2 * 128) * Headdim + 2 * 128 * 128)) { // 104 KB
             if constexpr(!Is_dropout) {  // We can afford more registers to keep V in registers
                 run_flash_bwd<Flash_bwd_kernel_traits<Headdim, 128, 128, 8, 4, 4, 4, true, false, T>, Is_dropout, Is_causal>(params, stream);
             } else {

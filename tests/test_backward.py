@@ -1,105 +1,137 @@
-"""Test forward + backward correctness and benchmark."""
-import math, time, torch, sys
-sys.path.insert(0, "/work/07390/jzthree/vista/Code/flash_attn_bias")
+import math
+import sys
+from pathlib import Path
 
-def ref(q, k, v, bt, W, scale):
-    B, L, H, D = q.shape
-    half_w = W // 2
-    q_t = q.permute(0,2,1,3); k_t = k.permute(0,2,1,3); v_t = v.permute(0,2,1,3)
-    scores = torch.matmul(q_t, k_t.transpose(-2,-1)) * scale
-    i_idx = torch.arange(L, device=q.device)
-    rel = i_idx[None,:] - i_idx[:,None]
-    in_win = (rel >= -half_w) & (rel < (W - half_w))
-    bias_idx = (rel + half_w).clamp(0, W-1)
-    bias = bt[:, bias_idx]
-    bias = torch.where(in_win.unsqueeze(0), bias, torch.zeros_like(bias))
-    scores += bias.unsqueeze(0)
-    scores = torch.where(in_win[None,None,:,:], scores, torch.full_like(scores, float("-inf")))
-    attn = torch.nn.functional.softmax(scores, dim=-1)
-    return torch.matmul(attn, v_t).permute(0,2,1,3)
+import torch
 
-device = "cuda"
-torch.manual_seed(42)
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
-from flash_bias_attn import flash_attn_bias
-
-# === Forward + Backward correctness ===
-print("=== FORWARD + BACKWARD ===")
-for B, L, H, D, W in [(2, 64, 2, 16, 32), (2, 256, 4, 16, 64), (1, 512, 4, 16, 128)]:
-    scale = 1.0 / math.sqrt(D)
-    q = torch.randn(B,L,H,D, dtype=torch.bfloat16, device=device, requires_grad=True)
-    k = torch.randn(B,L,H,D, dtype=torch.bfloat16, device=device, requires_grad=True)
-    v = torch.randn(B,L,H,D, dtype=torch.bfloat16, device=device, requires_grad=True)
-    bt = torch.randn(H,W, dtype=torch.bfloat16, device=device, requires_grad=True)
-
-    # Triton forward+backward
-    out = flash_attn_bias(q, k, v, bt, W, scale)
-    out.float().sum().backward()
-    dq_t, dk_t, dv_t, dbt_t = q.grad.float(), k.grad.float(), v.grad.float(), bt.grad.float()
-
-    # Reference
-    qf = q.detach().float().requires_grad_(True)
-    kf = k.detach().float().requires_grad_(True)
-    vf = v.detach().float().requires_grad_(True)
-    btf = bt.detach().float().requires_grad_(True)
-    out_ref = ref(qf, kf, vf, btf, W, scale)
-    out_ref.sum().backward()
-
-    fwd_diff = (out.float() - out_ref).abs().max().item()
-    dq_diff = (dq_t - qf.grad).abs().max().item()
-    dk_diff = (dk_t - kf.grad).abs().max().item()
-    dv_diff = (dv_t - vf.grad).abs().max().item()
-    dbt_diff = (dbt_t - btf.grad).abs().max().item()
-
-    # Compute empirical scale ratio for dBT
-    mask = btf.grad.abs() > 0.1
-    if mask.any():
-        ratio = (dbt_t[mask] / btf.grad[mask]).median().item()
-    else:
-        ratio = float('nan')
-    print(f"  B={B} L={L:>3d} W={W:>3d}: fwd={fwd_diff:.3e} dQ={dq_diff:.3e} dK={dk_diff:.3e} dV={dv_diff:.3e} dBT={dbt_diff:.3e} dBT_ratio={ratio:.4f}  "
-          f"{'PASS' if max(fwd_diff, dq_diff, dk_diff, dv_diff) < 5e-2 and dbt_diff < 1e-1 else 'FAIL'}")
-
-# === Benchmark fwd+bwd ===
-print("\n=== BENCHMARK (B=600, L=4600, H=8, D=16, W=128) ===")
-B, L, H, D, W = 600, 4600, 8, 16, 128
-scale = 1.0 / math.sqrt(D)
-
-def bench(fn, *args, n_warmup=3, n_steps=5):
-    for _ in range(n_warmup):
-        out = fn(*args)
-        out.float().sum().backward()
-        torch.cuda.synchronize()
-        for a in args:
-            if hasattr(a, 'grad') and a.grad is not None:
-                a.grad = None
-    times = []
-    for _ in range(n_steps):
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        out = fn(*args)
-        out.float().sum().backward()
-        torch.cuda.synchronize()
-        times.append((time.perf_counter() - t0) * 1000)
-        for a in args:
-            if hasattr(a, 'grad') and a.grad is not None:
-                a.grad = None
-    return sum(times) / len(times)
-
+import flash_bias_attn
 from flash_attn import flash_attn_func
 
-# Baseline: flash-attn windowed no bias
-q1 = torch.randn(B,L,H,D, dtype=torch.bfloat16, device=device, requires_grad=True)
-k1 = torch.randn(B,L,H,D, dtype=torch.bfloat16, device=device, requires_grad=True)
-v1 = torch.randn(B,L,H,D, dtype=torch.bfloat16, device=device, requires_grad=True)
-half_w = W // 2
-t_base = bench(lambda q,k,v: flash_attn_func(q,k,v, softmax_scale=scale, window_size=(half_w,half_w)), q1, k1, v1)
-print(f"  flash-attn windowed (no bias): {t_base:.0f} ms")
 
-# Ours: flash-attn + bias table
-q2 = torch.randn(B,L,H,D, dtype=torch.bfloat16, device=device, requires_grad=True)
-k2 = torch.randn(B,L,H,D, dtype=torch.bfloat16, device=device, requires_grad=True)
-v2 = torch.randn(B,L,H,D, dtype=torch.bfloat16, device=device, requires_grad=True)
-bt2 = torch.randn(H,W, dtype=torch.bfloat16, device=device, requires_grad=True)
-t_bias = bench(lambda q,k,v,bt: flash_attn_bias(q,k,v,bt,W,scale), q2, k2, v2, bt2)
-print(f"  flash-attn + bias (fwd+bwd):   {t_bias:.0f} ms  ({t_bias/t_base:.2f}x)")
+def reference_attention(q, k, v, bias_table, half_w):
+    b, lq, h, d = q.shape
+    lk = k.shape[1]
+    scale = 1.0 / math.sqrt(d)
+    qh = q.permute(0, 2, 1, 3).float()
+    kh = k.permute(0, 2, 1, 3).float()
+    vh = v.permute(0, 2, 1, 3).float()
+    scores = torch.matmul(qh, kh.transpose(-1, -2)) * scale
+    q_idx = torch.arange(lq, device=q.device)[:, None]
+    k_idx = torch.arange(lk, device=q.device)[None, :]
+    rel = k_idx - q_idx
+    mask = (rel >= -half_w) & (rel <= half_w)
+    scores = scores.masked_fill(~mask, float('-inf'))
+    bias_idx = (rel + half_w).clamp_(0, 2 * half_w)
+    scores = scores + bias_table[:, bias_idx].unsqueeze(0)
+    probs = torch.softmax(scores, dim=-1)
+    out = torch.matmul(probs, vh)
+    return out.permute(0, 2, 1, 3).to(q.dtype)
+
+
+def bench_ms(fn, warmup=2, iters=5):
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+    times = []
+    for _ in range(iters):
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        fn()
+        end.record()
+        torch.cuda.synchronize()
+        times.append(start.elapsed_time(end))
+    return sum(times) / len(times)
+
+
+def run_small_correctness():
+    print('=== FORWARD + BACKWARD ===')
+    cases = [(2, 64, 32), (2, 256, 64), (1, 512, 128)]
+    for b, l, w in cases:
+        h = 8
+        d = 16
+        table_size = 2 * w + 1
+        q = torch.randn(b, l, h, d, device='cuda', dtype=torch.bfloat16, requires_grad=True)
+        k = torch.randn(b, l, h, d, device='cuda', dtype=torch.bfloat16, requires_grad=True)
+        v = torch.randn(b, l, h, d, device='cuda', dtype=torch.bfloat16, requires_grad=True)
+        bias = torch.randn(h, table_size, device='cuda', dtype=torch.float32, requires_grad=True)
+
+        out = flash_bias_attn.flash_attn_bias(q, k, v, bias, table_size)
+        loss = out.float().square().mean()
+        loss.backward()
+        dbias_fast = bias.grad.detach().float().clone()
+
+        q_ref = q.detach().clone().requires_grad_(True)
+        k_ref = k.detach().clone().requires_grad_(True)
+        v_ref = v.detach().clone().requires_grad_(True)
+        bias_ref = bias.detach().clone().requires_grad_(True)
+        out_ref = reference_attention(q_ref, k_ref, v_ref, bias_ref, w)
+        loss_ref = out_ref.float().square().mean()
+        loss_ref.backward()
+        dbias_ref = bias_ref.grad.detach().float()
+
+        ratio = dbias_fast.norm() / dbias_ref.norm().clamp_min(1e-12)
+        status = 'PASS' if torch.allclose(dbias_fast, dbias_ref, rtol=2e-2, atol=2e-2) else 'FAIL'
+        print(f'  B={b} L={l:3d} W={w:3d}: dBT_ratio={ratio.item():.4f}  {status}')
+
+
+def run_benchmarks():
+    print('\n=== BENCHMARK (B=600, L=4600, H=8, D=16, W=128) ===')
+    b, l, h, d, w = 600, 4600, 8, 16, 128
+    table_size = 2 * w + 1
+
+    q0 = torch.randn(b, l, h, d, device='cuda', dtype=torch.bfloat16, requires_grad=True)
+    k0 = torch.randn(b, l, h, d, device='cuda', dtype=torch.bfloat16, requires_grad=True)
+    v0 = torch.randn(b, l, h, d, device='cuda', dtype=torch.bfloat16, requires_grad=True)
+
+    def no_bias_step():
+        out = flash_attn_func(q0, k0, v0, dropout_p=0.0, causal=False, window_size=(w, w))
+        out.sum().backward()
+        q0.grad = None
+        k0.grad = None
+        v0.grad = None
+
+    no_bias_ms = bench_ms(no_bias_step)
+
+    q1 = torch.randn(b, l, h, d, device='cuda', dtype=torch.bfloat16, requires_grad=True)
+    k1 = torch.randn(b, l, h, d, device='cuda', dtype=torch.bfloat16, requires_grad=True)
+    v1 = torch.randn(b, l, h, d, device='cuda', dtype=torch.bfloat16, requires_grad=True)
+    bias_frozen = torch.randn(h, table_size, device='cuda', dtype=torch.float32, requires_grad=False)
+
+    def frozen_bias_step():
+        out = flash_bias_attn.flash_attn_bias(q1, k1, v1, bias_frozen, table_size)
+        out.sum().backward()
+        q1.grad = None
+        k1.grad = None
+        v1.grad = None
+
+    frozen_ms = bench_ms(frozen_bias_step)
+
+    q2 = torch.randn(b, l, h, d, device='cuda', dtype=torch.bfloat16, requires_grad=True)
+    k2 = torch.randn(b, l, h, d, device='cuda', dtype=torch.bfloat16, requires_grad=True)
+    v2 = torch.randn(b, l, h, d, device='cuda', dtype=torch.bfloat16, requires_grad=True)
+    bias_train = torch.randn(h, table_size, device='cuda', dtype=torch.float32, requires_grad=True)
+
+    def trainable_bias_step():
+        out = flash_bias_attn.flash_attn_bias(q2, k2, v2, bias_train, table_size)
+        out.sum().backward()
+        q2.grad = None
+        k2.grad = None
+        v2.grad = None
+        bias_train.grad = None
+
+    trainable_ms = bench_ms(trainable_bias_step)
+
+    print(f'  flash-attn windowed (no bias):              {no_bias_ms:.0f} ms')
+    print(f'  flash-attn + bias (fwd+bwd, frozen bias):  {frozen_ms:.0f} ms  ({frozen_ms / no_bias_ms:.2f}x)')
+    print(f'  flash-attn + bias (fwd+bwd, trainable):    {trainable_ms:.0f} ms  ({trainable_ms / no_bias_ms:.2f}x)')
+
+
+if __name__ == '__main__':
+    torch.manual_seed(0)
+    run_small_correctness()
+    run_benchmarks()

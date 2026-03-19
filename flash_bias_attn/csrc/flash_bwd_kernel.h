@@ -84,18 +84,20 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     using ElementAccum = typename Kernel_traits::ElementAccum;
     using index_t = typename Kernel_traits::index_t;
 
-    // Shared memory.
-    extern __shared__ char smem_[];
-
-    // The thread index.
-    const int tidx = threadIdx.x;
-
     constexpr int kBlockM = Kernel_traits::kBlockM;
     constexpr int kBlockN = Kernel_traits::kBlockN;
     constexpr int kHeadDim = Kernel_traits::kHeadDim;
     constexpr int MMA_N_SdP = kBlockN / decltype(typename Kernel_traits::TiledMmaSdP{}.template tile_size_mnk<1>())::value;
     constexpr int AtomLayoutMS = Kernel_traits::AtomLayoutMSdP;
     constexpr bool Double_buffer = !Kernel_traits::No_double_buffer;
+    constexpr int kDbiasBins = kBlockM + kBlockN - 1;
+
+    // Shared memory.
+    extern __shared__ char smem_[];
+    __shared__ float dbias_block[kDbiasBins];
+
+    // The thread index.
+    const int tidx = threadIdx.x;
 
     const BlockInfo</*Varlen=*/!Is_even_MN> binfo(params, bidb);
     if (n_block * kBlockN >= binfo.actual_seqlen_k) return;
@@ -452,9 +454,7 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
     clear(acc_dk);
 
     const float alibi_slope = !Has_alibi || params.alibi_slopes_ptr == nullptr ? 0.0f : reinterpret_cast<float *>(params.alibi_slopes_ptr)[bidb * params.alibi_slopes_batch_stride + bidh] / params.scale_softmax;
-    const float *bias_table_head = params.bias_table_ptr != nullptr
-        ? params.bias_table_ptr + bidh * params.bias_table_window_size
-        : nullptr;
+    const float *bias_table_head = params.bias_table_ptr == nullptr ? nullptr : params.bias_table_ptr + bidh * params.bias_table_window_size;
     FLASH_NAMESPACE::Alibi<Is_causal> alibi(alibi_slope, binfo.actual_seqlen_k, binfo.actual_seqlen_q);
 
     for (; m_block >= m_block_min; --m_block) {
@@ -633,7 +633,13 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
             const int row_idx_offset = m_block * kBlockM + get<0>(taccScS_row(0));
             const int warp_row_stride = AtomLayoutMS * 16;
             const int half_w = params.bias_table_window_size / 2;
+            const int seq_delta = binfo.actual_seqlen_k - binfo.actual_seqlen_q;
+            const int rel_min = n_block * kBlockN - (m_block * kBlockM + kBlockM - 1 + seq_delta);
             float *dbias_head = params.dbias_table_ptr + bidh * params.bias_table_window_size;
+            for (int t = tidx; t < kDbiasBins; t += Kernel_traits::kNThreads) {
+                dbias_block[t] = 0.0f;
+            }
+            __syncthreads();
             #pragma unroll 1
             for (int mi = 0; mi < size<0, 1>(dS); ++mi) {
                 const int row_idx = row_idx_offset + mi * warp_row_stride;
@@ -648,10 +654,10 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
                             for (int j = 0; j < size<1, 0>(dS); ++j) {
                                 const int col = col_idx_base + j;
                                 if (col < binfo.actual_seqlen_k) {
-                                    const int rel = col - (row + binfo.actual_seqlen_k - binfo.actual_seqlen_q);
-                                    const int idx = rel + half_w;
-                                    if (idx >= 0 && idx < params.bias_table_window_size) {
-                                        atomicAdd(dbias_head + idx, dS(make_coord(i, mi), make_coord(j, nj)));
+                                    const int rel = col - (row + seq_delta);
+                                    const int local_idx = rel - rel_min;
+                                    if (local_idx >= 0 && local_idx < kDbiasBins) {
+                                        atomicAdd(&dbias_block[local_idx], dS(make_coord(i, mi), make_coord(j, nj)));
                                     }
                                 }
                             }
@@ -659,6 +665,15 @@ inline __device__ void compute_dq_dk_dv_1colblock(const Params &params, const in
                     }
                 }
             }
+            __syncthreads();
+            for (int t = tidx; t < kDbiasBins; t += Kernel_traits::kNThreads) {
+                const int idx = rel_min + t + half_w;
+                const float val = dbias_block[t];
+                if (val != 0.0f && idx >= 0 && idx < params.bias_table_window_size) {
+                    atomicAdd(dbias_head + idx, val);
+                }
+            }
+            __syncthreads();
         }
 
         Tensor acc_dq = partition_fragment_C(tiled_mma_dq, Shape<Int<kBlockM>, Int<kHeadDim>>{});  // MMA, MMA_N, MMA_K
@@ -876,14 +891,14 @@ inline __device__ void compute_dq_dk_dv(const Params &params) {
 
     const int n_block_max = (params.seqlen_k + Kernel_traits::kBlockN - 1) / Kernel_traits::kBlockN;
     if (n_block_max == 1) {
-        compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Has_alibi, Is_even_M, Is_even_K, true, true>(params, bidb, bidh, 0);
+        compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, /*Is_local=*/false, Has_alibi, /*Is_even_MN=*/Is_even_M, /*Is_even_K=*/Is_even_K, /*Is_softcap=*/false, true, true>(params, bidb, bidh, 0);
     } else {
         // Iterating backward from n_block_max - 1 to 0 might save 1 register
-        compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Has_alibi, Is_even_M, Is_even_K, true, false>(params, bidb, bidh, n_block_max - 1);
+        compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, /*Is_local=*/false, Has_alibi, /*Is_even_MN=*/Is_even_M, /*Is_even_K=*/Is_even_K, /*Is_softcap=*/false, true, false>(params, bidb, bidh, n_block_max - 1);
         for (int n_block = n_block_max - 2; n_block > 0; n_block--) {
-            compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Has_alibi, Is_even_M, Is_even_K, false, false>(params, bidb, bidh, n_block);
+            compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, /*Is_local=*/false, Has_alibi, /*Is_even_MN=*/Is_even_M, /*Is_even_K=*/Is_even_K, /*Is_softcap=*/false, false, false>(params, bidb, bidh, n_block);
         }
-        compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, Has_alibi, Is_even_M, Is_even_K, false, true>(params, bidb, bidh, 0);
+        compute_dq_dk_dv_1colblock<Kernel_traits, Is_dropout, Is_causal, /*Is_local=*/false, Has_alibi, /*Is_even_MN=*/Is_even_M, /*Is_even_K=*/Is_even_K, /*Is_softcap=*/false, false, true>(params, bidb, bidh, 0);
     }
 }
 
