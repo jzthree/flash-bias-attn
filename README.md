@@ -83,7 +83,7 @@ The bias table values are pre-divided by `softmax_scale` to match Flash Attentio
 ### Why not other approaches?
 
 - **FlexAttention + score_mod**: The `score_mod` callback prevents kernel fusion, causing 122x slowdown
-- **FlashBias concatenation trick**: Fast at very low rank, but for trainable relative-position bias it showed large approximation error at practical ranks. The concat path is now deprecated and kept only as an experimental baseline.
+- **FlashBias concatenation trick**: Effective when the bias is exact low-rank or strongly compressible (for example ALiBi, or precomputed low-rank decompositions used in some vision models). For the target setting in this repo, a trainable sliding-window Toeplitz bias table was not accurate enough at practical ranks to serve as a drop-in replacement. The concat path is therefore deprecated and kept only as an experimental baseline.
 - **Custom Triton kernel**: Correct but 12x slower than Flash Attention's optimized CUDA (the "Triton tax")
 - **This approach**: Directly modifies the CUDA kernel — exact and fast
 
