@@ -13,6 +13,27 @@ template<typename T, int Headdim, bool Is_causal>
 void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream);
 }
 
+void flash_attn_bias_d1_fwd_cuda(
+    const at::Tensor &q, const at::Tensor &k, const at::Tensor &v,
+    const at::Tensor &bias_table_t,
+    at::Tensor &out, at::Tensor &softmax_lse,
+    float softmax_scale,
+    int window_size_left, int window_size_right,
+    cudaStream_t stream
+);
+
+void flash_attn_bias_d1_bwd_cuda(
+    const at::Tensor &dout,
+    const at::Tensor &q, const at::Tensor &k, const at::Tensor &v,
+    const at::Tensor &out, const at::Tensor &softmax_lse,
+    const at::Tensor &bias_table_t,
+    at::Tensor &dq, at::Tensor &dk, at::Tensor &dv, at::Tensor &dbias_table_t,
+    float softmax_scale,
+    int window_size_left, int window_size_right,
+    bool compute_dbias,
+    cudaStream_t stream
+);
+
 // Set up params struct from PyTorch tensors
 void set_params_fwd(FLASH_NAMESPACE::Flash_fwd_params &params,
                     const at::Tensor &q, const at::Tensor &k, const at::Tensor &v,
@@ -111,6 +132,25 @@ std::vector<at::Tensor> flash_attn_bias_fwd(
     const int num_heads = q.size(2);
     const int head_size = q.size(3);
     const int seqlen_q_rounded = ((seqlen_q + 127) / 128) * 128;
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+
+    if (head_size == 1) {
+        TORCH_CHECK(q.size(2) == k.size(2) && q.size(2) == v.size(2),
+                    "D=1 specialized path requires q, k, v to have the same number of heads");
+        TORCH_CHECK(window_size_left >= 0 && window_size_right >= 0,
+                    "D=1 specialized path only supports local non-causal attention");
+        TORCH_CHECK(bias_table.defined() && bias_table.numel() > 0,
+                    "D=1 specialized path requires a bias table");
+        auto out = torch::empty_like(q);
+        auto softmax_lse = torch::zeros({batch_size, num_heads, seqlen_q_rounded},
+                                        q.options().dtype(at::kFloat));
+        auto bias_table_t = bias_table.to(at::kFloat).transpose(0, 1).contiguous();
+        flash_attn_bias_d1_fwd_cuda(
+            q, k, v, bias_table_t, out, softmax_lse,
+            softmax_scale, window_size_left, window_size_right, stream
+        );
+        return {out, softmax_lse};
+    }
 
     auto out = torch::empty_like(q);
     auto softmax_lse = torch::empty({batch_size, num_heads, seqlen_q_rounded},
@@ -130,8 +170,6 @@ std::vector<at::Tensor> flash_attn_bias_fwd(
     set_params_fwd(params, q, k, v, out, softmax_lse,
                    softmax_scale, window_size_left, window_size_right,
                    bias_table_f32);
-
-    auto stream = at::cuda::getCurrentCUDAStream().stream();
 
     // Only hdim32, bf16, non-causal is compiled
     TORCH_CHECK(head_size <= 32, "Only head_size <= 32 supported (compiled for hdim32)");
@@ -164,6 +202,40 @@ std::vector<at::Tensor> flash_attn_bias_bwd(
     const int seqlen_k = k.size(1);
     const int seqlen_q_rounded = ((seqlen_q + 127) / 128) * 128;
     const int seqlen_k_rounded = ((seqlen_k + 127) / 128) * 128;
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+
+    if (head_size == 1) {
+        TORCH_CHECK(q.size(2) == k.size(2) && q.size(2) == v.size(2),
+                    "D=1 specialized path requires q, k, v to have the same number of heads");
+        TORCH_CHECK(window_size_left >= 0 && window_size_right >= 0,
+                    "D=1 specialized path only supports local non-causal attention");
+        TORCH_CHECK(bias_table.defined() && bias_table.numel() > 0,
+                    "D=1 specialized path requires a bias table");
+        const int window_size = bias_table.size(1);
+        TORCH_CHECK(
+            static_cast<size_t>(window_size) * 32 * sizeof(float) +
+            static_cast<size_t>(2 * 64) * 32 * sizeof(float) +
+            static_cast<size_t>(2 * 64) * 32 * sizeof(at::BFloat16) <= 96 * 1024,
+            "D=1 specialized path currently exceeds the shared-memory budget"
+        );
+
+        auto dq = torch::zeros_like(q);
+        auto dk = torch::zeros_like(k);
+        auto dv = torch::zeros_like(v);
+        auto bias_table_t = bias_table.to(at::kFloat).transpose(0, 1).contiguous();
+        auto dbias_table_t = compute_dbias
+            ? torch::zeros({window_size, num_heads}, q.options().dtype(at::kFloat))
+            : at::Tensor();
+
+        flash_attn_bias_d1_bwd_cuda(
+            dout, q, k, v, out, softmax_lse, bias_table_t,
+            dq, dk, dv, dbias_table_t,
+            softmax_scale, window_size_left, window_size_right,
+            compute_dbias, stream
+        );
+        auto dbias = compute_dbias ? dbias_table_t.transpose(0, 1).contiguous() : at::Tensor();
+        return {dq, dk, dv, dbias};
+    }
 
     auto dq = torch::zeros_like(q);
     auto dk = torch::empty_like(k);
@@ -235,7 +307,6 @@ std::vector<at::Tensor> flash_attn_bias_bwd(
 
     // No alibi_slopes needed — bias table lookup is independent of Has_alibi template
 
-    auto stream = at::cuda::getCurrentCUDAStream().stream();
     TORCH_CHECK(head_size <= 32, "Only head_size <= 32 supported");
 
     FLASH_NAMESPACE::run_mha_bwd_<cutlass::bfloat16_t, 32, /*Is_causal=*/false>(params, stream);

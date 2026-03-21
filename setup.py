@@ -64,6 +64,7 @@ setup(
             name="flash_attn_bias_cuda",
             sources=[
                 "flash_bias_attn/csrc/flash_api_bias.cpp",
+                "flash_bias_attn/csrc/flash_d1_hdim1_bf16_sm80.cu",
                 "flash_bias_attn/csrc/flash_fwd_hdim32_bf16_sm80.cu",
                 "flash_bias_attn/csrc/flash_bwd_hdim32_bf16_sm80.cu",
             ],
