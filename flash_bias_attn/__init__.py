@@ -39,12 +39,15 @@ except ImportError:
 
 
 def _pad_to_8(x):
-    """Pad head dim to multiple of 8 for CUTLASS alignment.
-    D=1,2,4,8 are kept as-is (custom small-D kernels)."""
+    """Pad head dim for kernel alignment.
+    D=1: kept as-is (D1 custom kernel).
+    D=2-7: padded to 8 (hdim32 kernel).
+    D>=8, D%8==0: kept as-is.
+    D>=8, D%8!=0: padded to next multiple of 8."""
     D = x.shape[-1]
-    if D <= 8 or D % 8 == 0:
+    if D == 1 or (D >= 8 and D % 8 == 0):
         return x, D
-    D_pad = ((D + 7) // 8) * 8
+    D_pad = max(8, ((D + 7) // 8) * 8)
     pad = torch.zeros(*x.shape[:-1], D_pad - D, dtype=x.dtype, device=x.device)
     return torch.cat([x, pad], dim=-1), D
 
