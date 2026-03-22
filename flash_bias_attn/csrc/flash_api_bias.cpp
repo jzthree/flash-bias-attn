@@ -171,15 +171,21 @@ std::vector<at::Tensor> flash_attn_bias_fwd(
                    softmax_scale, window_size_left, window_size_right,
                    bias_table_f32);
 
-    // Only hdim32, bf16, non-causal is compiled
-    TORCH_CHECK(head_size <= 32, "Only head_size <= 32 supported (compiled for hdim32)");
+    TORCH_CHECK(head_size <= 256, "head_size > 256 not supported");
 
     // Is_local = true when window_size >= 0
     const bool is_local = (window_size_left >= 0) || (window_size_right >= 0);
 
-    // Is_local=true for windowed attention ensures row indices are computed in mask.h,
-    // which our bias_table lookup needs. No template changes required.
-    FLASH_NAMESPACE::run_mha_fwd_<cutlass::bfloat16_t, 32, /*Is_causal=*/false>(params, stream);
+    // Dispatch by head dim bucket
+    if (head_size <= 32) {
+        FLASH_NAMESPACE::run_mha_fwd_<cutlass::bfloat16_t, 32, false>(params, stream);
+    } else if (head_size <= 64) {
+        FLASH_NAMESPACE::run_mha_fwd_<cutlass::bfloat16_t, 64, false>(params, stream);
+    } else if (head_size <= 128) {
+        FLASH_NAMESPACE::run_mha_fwd_<cutlass::bfloat16_t, 128, false>(params, stream);
+    } else {
+        FLASH_NAMESPACE::run_mha_fwd_<cutlass::bfloat16_t, 256, false>(params, stream);
+    }
 
     return {out, softmax_lse};
 }
@@ -307,9 +313,18 @@ std::vector<at::Tensor> flash_attn_bias_bwd(
 
     // No alibi_slopes needed — bias table lookup is independent of Has_alibi template
 
-    TORCH_CHECK(head_size <= 32, "Only head_size <= 32 supported");
+    TORCH_CHECK(head_size <= 256, "head_size > 256 not supported");
 
-    FLASH_NAMESPACE::run_mha_bwd_<cutlass::bfloat16_t, 32, /*Is_causal=*/false>(params, stream);
+    // Dispatch by head dim bucket
+    if (head_size <= 32) {
+        FLASH_NAMESPACE::run_mha_bwd_<cutlass::bfloat16_t, 32, false>(params, stream);
+    } else if (head_size <= 64) {
+        FLASH_NAMESPACE::run_mha_bwd_<cutlass::bfloat16_t, 64, false>(params, stream);
+    } else if (head_size <= 128) {
+        FLASH_NAMESPACE::run_mha_bwd_<cutlass::bfloat16_t, 128, false>(params, stream);
+    } else {
+        FLASH_NAMESPACE::run_mha_bwd_<cutlass::bfloat16_t, 256, false>(params, stream);
+    }
 
     // Scale dbias: the kernel accumulates dS in un-scaled score space (scores = QK^T, not QK^T*scale).
     // The bias was pre-divided by scale in forward, so dBias_unscaled = dL/d(bias/scale) = dL/d(bias) * scale.

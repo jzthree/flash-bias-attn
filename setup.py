@@ -67,6 +67,12 @@ setup(
                 "flash_bias_attn/csrc/flash_d1_hdim1_bf16_sm80.cu",
                 "flash_bias_attn/csrc/flash_fwd_hdim32_bf16_sm80.cu",
                 "flash_bias_attn/csrc/flash_bwd_hdim32_bf16_sm80.cu",
+                "flash_bias_attn/csrc/flash_fwd_hdim64_bf16_sm80.cu",
+                "flash_bias_attn/csrc/flash_bwd_hdim64_bf16_sm80.cu",
+                "flash_bias_attn/csrc/flash_fwd_hdim128_bf16_sm80.cu",
+                "flash_bias_attn/csrc/flash_bwd_hdim128_bf16_sm80.cu",
+                "flash_bias_attn/csrc/flash_fwd_hdim256_bf16_sm80.cu",
+                "flash_bias_attn/csrc/flash_bwd_hdim256_bf16_sm80.cu",
             ],
             include_dirs=[
                 os.path.abspath("flash_bias_attn/csrc"),
