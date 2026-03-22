@@ -38,6 +38,16 @@ except ImportError:
         _HAS_CUDA = False
 
 
+def _pad_to_8(x):
+    """Pad head dim to multiple of 8 for CUTLASS alignment. D=1 is kept as-is (custom kernel)."""
+    D = x.shape[-1]
+    if D == 1 or (D >= 8 and D % 8 == 0):
+        return x, D
+    D_pad = max(8, ((D + 7) // 8) * 8)
+    pad = torch.zeros(*x.shape[:-1], D_pad - D, dtype=x.dtype, device=x.device)
+    return torch.cat([x, pad], dim=-1), D
+
+
 class FlashAttnBiasFunc(torch.autograd.Function):
     @staticmethod
     def forward(ctx, q, k, v, bias_table, window_size, softmax_scale):
@@ -47,30 +57,44 @@ class FlashAttnBiasFunc(torch.autograd.Function):
         ws_left = half_w
         ws_right = half_w - 1 + (window_size % 2)
 
-        q, k, v = [x.contiguous() if x.stride(-1) != 1 else x for x in (q, k, v)]
+        # Pad small head dims to multiple of 8 for CUTLASS alignment
+        q_pad, D_orig = _pad_to_8(q)
+        k_pad, _ = _pad_to_8(k)
+        v_pad, _ = _pad_to_8(v)
+
+        q_pad, k_pad, v_pad = [x.contiguous() if x.stride(-1) != 1 else x for x in (q_pad, k_pad, v_pad)]
         bt = bias_table.contiguous()
 
-        out, lse = flash_attn_bias_cuda.flash_attn_bias_fwd(
-            q, k, v, bt, softmax_scale, ws_left, ws_right,
+        out_pad, lse = flash_attn_bias_cuda.flash_attn_bias_fwd(
+            q_pad, k_pad, v_pad, bt, softmax_scale, ws_left, ws_right,
         )
 
-        ctx.save_for_backward(q, k, v, out, lse, bt)
+        ctx.save_for_backward(q_pad, k_pad, v_pad, out_pad, lse, bt)
         ctx.softmax_scale = softmax_scale
         ctx.window_size = window_size
         ctx.ws_left = ws_left
         ctx.ws_right = ws_right
-        return out
+        ctx.D_orig = D_orig
+        return out_pad[..., :D_orig]
 
     @staticmethod
     def backward(ctx, dout):
-        q, k, v, out, lse, bt = ctx.saved_tensors
-        dout = dout.contiguous()
+        q_pad, k_pad, v_pad, out_pad, lse, bt = ctx.saved_tensors
+        D_orig = ctx.D_orig
 
-        dq, dk, dv, dbias = flash_attn_bias_cuda.flash_attn_bias_bwd(
-            dout, q, k, v, out, lse, bt,
+        # Pad dout to match padded head dim
+        if dout.shape[-1] < q_pad.shape[-1]:
+            dout_pad = torch.zeros_like(q_pad)
+            dout_pad[..., :D_orig] = dout
+        else:
+            dout_pad = dout
+        dout_pad = dout_pad.contiguous()
+
+        dq_pad, dk_pad, dv_pad, dbias = flash_attn_bias_cuda.flash_attn_bias_bwd(
+            dout_pad, q_pad, k_pad, v_pad, out_pad, lse, bt,
             ctx.softmax_scale, ctx.ws_left, ctx.ws_right, ctx.needs_input_grad[3],
         )
-        return dq, dk, dv, dbias, None, None
+        return dq_pad[..., :D_orig], dk_pad[..., :D_orig], dv_pad[..., :D_orig], dbias, None, None
 
 
 def flash_attn_bias(q, k, v, bias_table, window_size, softmax_scale=None):
