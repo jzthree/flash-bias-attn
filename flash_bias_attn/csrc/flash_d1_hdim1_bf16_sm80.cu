@@ -9,7 +9,7 @@
 namespace {
 
 constexpr int kWarpSize = 32;
-constexpr int kWarpsPerBlock = 16;
+constexpr int kWarpsPerBlock = 24;
 constexpr int kThreads = kWarpSize * kWarpsPerBlock;
 constexpr int kKChunk = 64;
 
