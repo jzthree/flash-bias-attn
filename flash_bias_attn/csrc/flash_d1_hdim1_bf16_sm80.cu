@@ -30,7 +30,7 @@ __device__ __forceinline__ int64_t idx3(
          + static_cast<int64_t>(head) * head_stride;
 }
 
-__global__ void flash_d1_fwd_kernel(
+__global__ __launch_bounds__(768, 1) void flash_d1_fwd_kernel(
     const __nv_bfloat16* __restrict__ q,
     const __nv_bfloat16* __restrict__ k,
     const __nv_bfloat16* __restrict__ v,
@@ -80,7 +80,7 @@ __global__ void flash_d1_fwd_kernel(
     }
 }
 
-__global__ void flash_d1_bwd_dq_dbias_kernel(
+__global__ __launch_bounds__(768, 1) void flash_d1_bwd_dq_dbias_kernel(
     const __nv_bfloat16* __restrict__ dout,
     const __nv_bfloat16* __restrict__ q,
     const __nv_bfloat16* __restrict__ k,
@@ -224,7 +224,7 @@ __global__ void flash_d1_bwd_dq_dbias_kernel(
     }
 }
 
-__global__ void flash_d1_bwd_dk_dv_kernel(
+__global__ __launch_bounds__(768, 1) void flash_d1_bwd_dk_dv_kernel(
     const __nv_bfloat16* __restrict__ dout,
     const __nv_bfloat16* __restrict__ q,
     const __nv_bfloat16* __restrict__ k,

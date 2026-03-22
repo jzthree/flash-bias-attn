@@ -93,5 +93,8 @@ setup(
             },
         )
     ],
+    # Note: D1 kernel benefits from reg=255 while hdim32/128 prefer reg=128.
+    # The global --maxrregcount applies to all .cu files. For per-file tuning,
+    # the D1 kernel embeds __launch_bounds__ directives internally.
     cmdclass={"build_ext": BuildExtension},
 )
