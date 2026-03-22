@@ -1,3 +1,4 @@
+#pragma nv_maxrregcount 255
 // Copyright (c) 2024, Tri Dao.
 // Splitting the different head dimensions to different files to speed up compilation.
 // This file is auto-generated. See "generate_kernels.py"

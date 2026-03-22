@@ -1,3 +1,4 @@
+#pragma nv_maxrregcount 255
 #include <torch/extension.h>
 
 #include <cuda.h>
