@@ -22,6 +22,24 @@ void flash_attn_bias_d1_fwd_cuda(
     cudaStream_t stream
 );
 
+void flash_attn_bias_dsmall_fwd_cuda(
+    const at::Tensor &q, const at::Tensor &k, const at::Tensor &v,
+    const at::Tensor &bias_table_t,
+    at::Tensor &out, at::Tensor &softmax_lse,
+    float softmax_scale, int window_size_left, int window_size_right,
+    cudaStream_t stream
+);
+
+void flash_attn_bias_dsmall_bwd_cuda(
+    const at::Tensor &dout,
+    const at::Tensor &q, const at::Tensor &k, const at::Tensor &v,
+    const at::Tensor &out, const at::Tensor &softmax_lse,
+    const at::Tensor &bias_table_t,
+    at::Tensor &dq, at::Tensor &dk, at::Tensor &dv, at::Tensor &dbias_table_t,
+    float softmax_scale, int window_size_left, int window_size_right,
+    bool compute_dbias, cudaStream_t stream
+);
+
 void flash_attn_bias_d1_bwd_cuda(
     const at::Tensor &dout,
     const at::Tensor &q, const at::Tensor &k, const at::Tensor &v,
@@ -134,21 +152,28 @@ std::vector<at::Tensor> flash_attn_bias_fwd(
     const int seqlen_q_rounded = ((seqlen_q + 127) / 128) * 128;
     auto stream = at::cuda::getCurrentCUDAStream().stream();
 
-    if (head_size == 1) {
+    if (head_size <= 8) {
         TORCH_CHECK(q.size(2) == k.size(2) && q.size(2) == v.size(2),
-                    "D=1 specialized path requires q, k, v to have the same number of heads");
+                    "Small-D specialized path requires q, k, v to have the same number of heads");
         TORCH_CHECK(window_size_left >= 0 && window_size_right >= 0,
-                    "D=1 specialized path only supports local non-causal attention");
+                    "Small-D specialized path only supports local non-causal attention");
         TORCH_CHECK(bias_table.defined() && bias_table.numel() > 0,
-                    "D=1 specialized path requires a bias table");
+                    "Small-D specialized path requires a bias table");
         auto out = torch::empty_like(q);
         auto softmax_lse = torch::zeros({batch_size, num_heads, seqlen_q_rounded},
                                         q.options().dtype(at::kFloat));
         auto bias_table_t = bias_table.to(at::kFloat).transpose(0, 1).contiguous();
-        flash_attn_bias_d1_fwd_cuda(
-            q, k, v, bias_table_t, out, softmax_lse,
-            softmax_scale, window_size_left, window_size_right, stream
-        );
+        if (head_size == 1) {
+            flash_attn_bias_d1_fwd_cuda(
+                q, k, v, bias_table_t, out, softmax_lse,
+                softmax_scale, window_size_left, window_size_right, stream
+            );
+        } else {
+            flash_attn_bias_dsmall_fwd_cuda(
+                q, k, v, bias_table_t, out, softmax_lse,
+                softmax_scale, window_size_left, window_size_right, stream
+            );
+        }
         return {out, softmax_lse};
     }
 
@@ -210,20 +235,14 @@ std::vector<at::Tensor> flash_attn_bias_bwd(
     const int seqlen_k_rounded = ((seqlen_k + 127) / 128) * 128;
     auto stream = at::cuda::getCurrentCUDAStream().stream();
 
-    if (head_size == 1) {
+    if (head_size <= 8) {
         TORCH_CHECK(q.size(2) == k.size(2) && q.size(2) == v.size(2),
-                    "D=1 specialized path requires q, k, v to have the same number of heads");
+                    "Small-D specialized path requires q, k, v to have the same number of heads");
         TORCH_CHECK(window_size_left >= 0 && window_size_right >= 0,
-                    "D=1 specialized path only supports local non-causal attention");
+                    "Small-D specialized path only supports local non-causal attention");
         TORCH_CHECK(bias_table.defined() && bias_table.numel() > 0,
-                    "D=1 specialized path requires a bias table");
+                    "Small-D specialized path requires a bias table");
         const int window_size = bias_table.size(1);
-        TORCH_CHECK(
-            static_cast<size_t>(window_size) * 32 * sizeof(float) +
-            static_cast<size_t>(2 * 64) * 32 * sizeof(float) +
-            static_cast<size_t>(2 * 64) * 32 * sizeof(at::BFloat16) <= 96 * 1024,
-            "D=1 specialized path currently exceeds the shared-memory budget"
-        );
 
         auto dq = torch::zeros_like(q);
         auto dk = torch::zeros_like(k);
@@ -233,12 +252,21 @@ std::vector<at::Tensor> flash_attn_bias_bwd(
             ? torch::zeros({window_size, num_heads}, q.options().dtype(at::kFloat))
             : at::Tensor();
 
-        flash_attn_bias_d1_bwd_cuda(
-            dout, q, k, v, out, softmax_lse, bias_table_t,
-            dq, dk, dv, dbias_table_t,
-            softmax_scale, window_size_left, window_size_right,
-            compute_dbias, stream
-        );
+        if (head_size == 1) {
+            flash_attn_bias_d1_bwd_cuda(
+                dout, q, k, v, out, softmax_lse, bias_table_t,
+                dq, dk, dv, dbias_table_t,
+                softmax_scale, window_size_left, window_size_right,
+                compute_dbias, stream
+            );
+        } else {
+            flash_attn_bias_dsmall_bwd_cuda(
+                dout, q, k, v, out, softmax_lse, bias_table_t,
+                dq, dk, dv, dbias_table_t,
+                softmax_scale, window_size_left, window_size_right,
+                compute_dbias, stream
+            );
+        }
         auto dbias = compute_dbias ? dbias_table_t.transpose(0, 1).contiguous() : at::Tensor();
         return {dq, dk, dv, dbias};
     }

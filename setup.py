@@ -53,6 +53,7 @@ for arch in gpu_archs.split(";"):
 #   hdim256 fwd/bwd:   reg=128 default (untested at scale)
 _PER_FILE_REGS = {
     "flash_d1_hdim1_bf16_sm80.cu": 255,
+    "flash_dsmall_bf16_sm80.cu": 255,
     "flash_fwd_hdim32_bf16_sm80.cu": 128,
     "flash_bwd_hdim32_bf16_sm80.cu": 128,
     "flash_fwd_hdim64_bf16_sm80.cu": 255,
@@ -112,6 +113,7 @@ setup(
             sources=[
                 "flash_bias_attn/csrc/flash_api_bias.cpp",
                 "flash_bias_attn/csrc/flash_d1_hdim1_bf16_sm80.cu",
+                "flash_bias_attn/csrc/flash_dsmall_bf16_sm80.cu",
                 "flash_bias_attn/csrc/flash_fwd_hdim32_bf16_sm80.cu",
                 "flash_bias_attn/csrc/flash_bwd_hdim32_bf16_sm80.cu",
                 "flash_bias_attn/csrc/flash_fwd_hdim64_bf16_sm80.cu",
